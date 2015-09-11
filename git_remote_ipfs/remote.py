@@ -6,13 +6,14 @@ import hashlib
 import json
 
 import ipfsApi
+import fastimport.commands
 
 import git_remote_ipfs.marks
 from git_remote_ipfs.exc import *
 
 LOG = logging.getLogger(__name__)
 
-repo_format_version = 1
+repo_format_version = 2
 
 
 def quote_filename(f):
@@ -20,6 +21,8 @@ def quote_filename(f):
 
 
 class IPFSRemote (object):
+    default_branch = 'refs/heads/master'
+
     def __init__(self, git_dir, alias, url,
                  ipfs_gateway=None):
         self.git_dir = git_dir
@@ -65,6 +68,7 @@ class IPFSRemote (object):
 
         # fail quickly if we're not able to contact ipfs
         self.id = self.api.id()
+        LOG.debug('initialized ipfs api')
 
     def init_dir(self):
         if not os.path.isdir(self.pvt_dir):
@@ -75,9 +79,12 @@ class IPFSRemote (object):
         # Do nothing if we were able to load refs from a
         # toc file earlier.
         if self.marks.refs:
+            LOG.debug('found existing toc')
             return
 
         # We have no refs! See if we can find some in ipfs.
+        LOG.debug('processing url %s', self.url)
+
         if self.url.startswith('ipfs://'):
             hash = self.get_repo_from_url()
         elif self.url.startswith('/ipfs'):
@@ -88,6 +95,7 @@ class IPFSRemote (object):
             hash = None
 
         if not hash:
+            LOG.debug('unable to find repository metadata in ipfs')
             return
 
         LOG.debug('found repo ipfs hash = %s', hash)
@@ -100,17 +108,6 @@ class IPFSRemote (object):
             LOG.debug('found ref %s = %s', ref, hash)
             self.marks.set_ref(ref, hash)
 
-    def update_repo(self):
-        self.repo = self.api.add_json({
-            'version': repo_format_version,
-            'refs': self.marks.refs,
-        })
-
-        with open(self.repopath, 'w') as fd:
-            fd.write(self.repo + '\n')
-
-        LOG.info('ipfs repository hash = %s', self.repo)
-
     def get_repo_from_ipns(self, name):
         try:
             hash = self.api.name_resolve(name)['Path']
@@ -121,7 +118,6 @@ class IPFSRemote (object):
         return hash
 
     def get_repo_from_url(self):
-        LOG.info('reading refs from %s', self.url)
         url = urlparse.urlparse(self.url)
 
         # resolve via ipns
@@ -132,9 +128,25 @@ class IPFSRemote (object):
 
         return hash
 
+    def update(self):
+        LOG.debug('updating repository toc in ipfs')
+        self.repo = self.api.add_json({
+            'version': repo_format_version,
+            'refs': self.marks.refs,
+        })
+
+        with open(self.repopath, 'w') as fd:
+            fd.write(self.repo + '\n')
+
+        LOG.warn('new repository hash = %s', self.repo)
+
     def commit(self):
+        LOG.debug('committing repository to disk')
         self.marks.store()
-        self.update_repo()
+
+    def export_complete(self):
+        self.commit()
+        self.update()
 
     def cleanup(self):
         if self.temporary:
@@ -142,103 +154,46 @@ class IPFSRemote (object):
                 LOG.debug('removing directory %s', self.pvt_dir)
                 os.removedirs(self.pvt_dir)
 
-    def put_blob(self, obj):
-        hash = self.api.add_str(obj['content']['data'])
-        LOG.debug('added blob %s as %s', obj['mark'], hash)
-        self.marks.add_mark(obj['mark'], hash)
+    def add_blob(self, obj):
+        mark = obj.id
+        obj.mark = None
+        hash = self.api.add_str(str(obj))
+        LOG.debug('added blob %s as %s', mark, hash)
+        self.marks.add_mark(mark, hash)
 
     def set_ref(self, obj):
-        mark = obj['content'].get('parent')
+        mark = obj.from_
         if mark:
             hash = self.marks.from_mark(mark)
         else:
             hash = None
-        self.marks.set_ref(obj['content']['ref'], hash)
+        self.marks.set_ref(obj.ref, hash)
 
-    def resolve_markrefs(self, commit):
-        for file in commit['files']:
-            file['markref'] = self.marks.from_mark(file['markref'])
+    def resolve_marks(self, commit):
+        for fspec in commit.file_iter:
+            if hasattr(fspec, 'dataref'):
+                fspec.dataref = self.marks.from_mark(fspec.dataref)
 
-        parents = []
-        for parent in commit['parents']:
+        merges = []
+        for parent in commit.merges:
             parents.append(self.marks.from_mark(parent))
 
-        if 'parent' in commit:
-            commit['parent'] = self.marks.from_mark(commit['parent'])
+        commit.merges = merges
 
-    def put_commit(self, obj):
-        self.resolve_markrefs(obj['content'])
-        hash = self.api.add_str(json.dumps(obj['content'], sort_keys=True))
-        LOG.debug('added commit %s as %s', obj['mark'], hash)
-        self.marks.add_mark(obj['mark'], hash)
-        self.marks.set_ref(obj['content']['ref'], hash)
+        if commit.from_:
+            commit.from_ = self.marks.from_mark(commit.from_)
 
-    def export_commit(self, ref, hash):
-        if self.marks.is_marked(hash):
-            return
+    def add_commit(self, obj):
+        self.resolve_marks(obj)
+        mark = obj.id
+        obj.mark = None
+        hash = self.api.add_str(str(obj) + '\n')
+        LOG.debug('added commit %s as %s', mark, hash)
+        self.marks.add_mark(mark, hash)
+        self.marks.set_ref(obj.ref, hash)
 
-        commit = self.api.get_json(hash)
-        if 'parent' in commit:
-            self.export_commit(ref, commit['parent'])
-
-        for fspec in commit['files']:
-            self.export_file(fspec)
-
-        LOG.debug('exporting commit %s', hash)
-        if ref not in self.exported:
-            print 'reset %s' % ref
-            self.exported.add(ref)
-
-        print 'commit %s' % ref
-        mark = self.marks.add_rev(hash)
-        print 'mark :%d' % mark
-        if 'author' in commit:
-            print 'author %s' % commit['author']
-        if 'committer' in commit:
-            print 'committer %s' % commit['committer']
-        print 'data %d' % len(commit['data'])
-        print commit['data']
-        if 'parent' in commit:
-            print 'from :%d' % self.marks.from_rev(commit['parent'])
-        for parent in commit['parents']:
-            print 'merge %s' % parent
-        for fspec in commit['files']:
-            if fspec['action'] == 'M':
-                print 'M %s :%d %s' % (
-                    fspec['mode'],
-                    self.marks.from_rev(fspec['markref']),
-                    quote_filename(fspec['path']))
-            elif fspec['action'] == 'D':
-                print 'D %s' % (
-                    quote_filename(fspec['path']))
-            else:
-                raise ValueError(fspec)
-        print
-
-        self.marks.set_ref(ref, hash)
-
-    def export_file(self, fspec):
-        hash = fspec['markref']
-        LOG.debug('exporting file %s from %s', fspec['path'], hash)
-        data = self.api.cat(hash)
-        mark = self.marks.add_rev(hash)
-        print 'blob'
-        print 'mark :%d' % mark
-        print 'data %d' % (len(data))
-        print data
-
-    def export(self, ref):
-        self.exported = set()
-
-        try:
-            start = self.marks.get_ref(ref)
-        except KeyError:
-            raise UnknownReference(ref)
-
-        LOG.debug('exporting %s from %s', ref, start)
-        self.export_commit(ref, start)
-
-        last_mark = self.marks.from_rev(self.marks.refs[ref])
-        print 'reset %s' % ref
-        print 'from :%d' % last_mark
-        print
+    def adjust_ref(self, ref):
+        if ref.startswith('refs/heads/'):
+            return '%s/heads/%s' % (
+                self.prefix,
+                ref[len('refs/heads/'):])

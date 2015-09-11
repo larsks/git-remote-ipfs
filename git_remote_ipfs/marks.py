@@ -37,7 +37,7 @@ class Marks(object):
 
     def next_mark(self):
         self.last_mark += 1
-        return self.last_mark
+        return ':%d' % self.last_mark
 
     def from_rev(self, rev):
         return self.rev_marks[rev]

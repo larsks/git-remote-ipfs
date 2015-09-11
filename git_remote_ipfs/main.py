@@ -37,7 +37,8 @@ def parse_args():
 def main():
     args = parse_args()
     logging.basicConfig(level=args.loglevel)
-    
+    logging.getLogger('requests').setLevel('WARN')
+
     try:
         if args.git_dir is None:
             raise CLIError('GIT_DIR is undefined')
