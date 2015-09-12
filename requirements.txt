@@ -1,1 +1,2 @@
-git+https://github.com/ipfs/python-ipfs-api.git
+fastimport
+ipfs-api
