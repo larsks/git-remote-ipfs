@@ -96,6 +96,7 @@ class ExportProcessor(object):
         print commit
 
     def export(self, ref):
+        self.repo.refresh()
         self.exported = set()
 
         if ref == 'HEAD':

@@ -104,6 +104,9 @@ class IPFSRemote (object):
             LOG.debug('unable to find repository path in ipfs')
             return
 
+        self.refresh()
+
+    def refresh(self):
         self.repo = self.api.cat(self.path)
         self.repo_check_version()
         self.repo_discover_refs()
