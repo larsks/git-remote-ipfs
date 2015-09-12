@@ -61,8 +61,8 @@ class IPFSRemote (object):
 
             port = int(port)
         else:
-            host = None
-            port = None
+            host = 'localhost'
+            port = 5001
 
         self.api = ipfsApi.Client(host=host, port=port)
 
