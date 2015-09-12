@@ -44,6 +44,7 @@ class IPFSRemote (object):
 
         self.init_api()
         self.init_dir()
+        self.init_path()
         self.init_refs()
 
     def __repr__(self):
@@ -75,6 +76,23 @@ class IPFSRemote (object):
             LOG.debug('creating directory %s', self.pvt_dir)
             os.makedirs(self.pvt_dir)
 
+    def get_path_from_url(self):
+        if not self.url:
+            path = None
+        elif self.url.startswith('ipfs://'):
+            path = self.get_repo_from_url()
+        elif self.url[:5] in ['/ipfs', '/ipns']:
+            path = self.url
+        else:
+            raise InvalidURL(self.url)
+
+        return path
+
+    def init_path(self):
+        self.path = self.get_path_from_url()
+        if self.path:
+            LOG.debug('found repo ipfs path = %s', self.path)
+
     def init_refs(self):
         # Do nothing if we were able to load refs from a
         # toc file earlier.
@@ -82,51 +100,36 @@ class IPFSRemote (object):
             LOG.debug('found existing toc')
             return
 
-        # We have no refs! See if we can find some in ipfs.
-        LOG.debug('processing url %s', self.url)
-
-        if self.url.startswith('ipfs://'):
-            hash = self.get_repo_from_url()
-        elif self.url.startswith('/ipfs'):
-            hash = self.url
-        elif self.url.startswith('/ipns'):
-            hash = self.get_repo_from_ipns(self.url)
-        else:
-            hash = None
-
-        if not hash:
-            LOG.debug('unable to find repository metadata in ipfs')
+        if not self.path:
+            LOG.debug('unable to find repository path in ipfs')
             return
 
-        LOG.debug('found repo ipfs hash = %s', hash)
-        self.repo = self.api.get_json(hash)
+        self.repo = self.api.cat(self.path)
+        self.repo_check_version()
+        self.repo_discover_refs()
 
-        if self.repo.get('version') != repo_format_version:
-            raise IPFSError('incompatible repository format')
+    def repo_check_version(self):
+        found_version = self.repo.get('version')
+        if found_version != repo_format_version:
+            raise IPFSError(
+                'incompatible repository format (want %s, found %s)' % (
+                    repo_format_version, found_version))
 
+    def repo_discover_refs(self):
         for ref, hash in self.repo['refs'].items():
             LOG.debug('found ref %s = %s', ref, hash)
             self.marks.set_ref(ref, hash)
-
-    def get_repo_from_ipns(self, name):
-        try:
-            hash = self.api.name_resolve(name)['Path']
-        except KeyError:
-            raise IPFSError('failed to resolve name "%s"' % (
-                            url.netloc))
-
-        return hash
 
     def get_repo_from_url(self):
         url = urlparse.urlparse(self.url)
 
         # resolve via ipns
         if url.netloc:
-            return self.get_repo_from_ipns(url.netloc)
+            return '/ipns/%s' % url.netloc
         else:
-            hash = url.path[1:]
+            path = '/ipfs/%s' % url.path[1:]
 
-        return hash
+        return path
 
     def update(self):
         LOG.debug('updating repository toc in ipfs')
@@ -139,6 +142,10 @@ class IPFSRemote (object):
             fd.write(self.repo + '\n')
 
         LOG.warn('new repository hash = %s', self.repo)
+
+        if self.path.startswith('/ipns/%s' % self.id['ID']):
+            LOG.info('publishing new hash to %s', self.path)
+            self.api.name_publish(self.repo)
 
     def commit(self):
         LOG.debug('committing repository to disk')
